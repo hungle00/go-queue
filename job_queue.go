@@ -25,232 +25,226 @@ type JobQueue struct {
 }
 
 func NewJobQueue(rdb *redis.Client) *JobQueue {
-	jq := &JobQueue{rdb: rdb}
-	jq.createConsumerGroup(context.Background())
-	return jq
+	return &JobQueue{rdb: rdb}
 }
 
-// Enqueue đẩy job mới vào Redis Stream
+func (jq *JobQueue) EnsureConsumerGroup(ctx context.Context) error {
+	err := jq.rdb.XGroupCreateMkStream(ctx, StreamName, GroupName, "0").Err()
+	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+		return fmt.Errorf("create consumer group: %w", err)
+	}
+	return nil
+}
+
+// Enqueue stores a job and adds its ID to the Redis Stream.
 func (jq *JobQueue) Enqueue(ctx context.Context, jobType string, payload interface{}) (string, error) {
 	job, err := NewJob(jobType, payload)
 	if err != nil {
 		return "", err
 	}
 
-	if err := jq.saveJob(ctx, job); err != nil {
-		return "", err
-	}
-
-	// SADD status
-	jq.rdb.SAdd(ctx, jq.statusKey(job.Status), job.ID)
-
-	// XADD stream
-	msgID, err := jq.rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: StreamName,
-		Values: map[string]interface{}{"job_id": job.ID},
-	}).Result()
+	data, err := job.Serialize()
 	if err != nil {
 		return "", err
 	}
 
-	jq.UpdateStatus(ctx, job, StatusQueued)
+	pipe := jq.rdb.TxPipeline()
+	pipe.Set(ctx, jq.jobKey(job.ID), data, 0)
+	pipe.SAdd(ctx, jq.statusKey(job.Status), job.ID)
+	pipe.XAdd(ctx, &redis.XAddArgs{
+		Stream: StreamName,
+		Values: map[string]interface{}{"job_id": job.ID},
+	})
+	if _, err := pipe.Exec(ctx); err != nil {
+		return "", fmt.Errorf("enqueue job: %w", err)
+	}
 
-	fmt.Printf("Enqueued job=%s, message=%s\n", job.ID, msgID)
 	return job.ID, nil
 }
 
-// GetJob lấy thông tin Job bằng job_id
+// GetJob retrieves a job by its ID.
 func (jq *JobQueue) GetJob(ctx context.Context, jobID string) (*Job, error) {
 	data, err := jq.rdb.Get(ctx, jq.jobKey(jobID)).Result()
 	if err == redis.Nil {
-		return nil, nil // Job không tồn tại
-	} else if err != nil {
+		return nil, nil
+	}
+	if err != nil {
 		return nil, err
 	}
 
 	return DeserializeJob(data)
 }
 
-// FetchJobs lấy danh sách message từ Redis Stream
 type FetchedJob struct {
 	MessageID string
 	JobID     string
 }
 
-func (jq *JobQueue) FetchJobs(ctx context.Context, consumerName string, count int64, blockMs time.Duration) ([]FetchedJob, error) {
-	for {
-		entries, err := jq.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    GroupName,
-			Consumer: consumerName,
-			Streams:  []string{StreamName, ">"},
-			Count:    count,
-			Block:    blockMs,
-		}).Result()
-
-		if err == redis.Nil || len(entries) == 0 {
-			fmt.Println("No new messages. Waiting...")
-			return nil, nil
-		} else if err != nil {
-			return nil, err
-		}
-
-		var parsedJobs []FetchedJob
-		for _, stream := range entries {
-			for _, message := range stream.Messages {
-				jobID, _ := message.Values["job_id"].(string)
-				parsedJobs = append(parsedJobs, FetchedJob{
-					MessageID: message.ID,
-					JobID:     jobID,
-				})
-			}
-		}
-
-		return parsedJobs, nil
+// FetchJobs reads new messages from the consumer group's stream.
+func (jq *JobQueue) FetchJobs(ctx context.Context, consumerName string, count int64, block time.Duration) ([]FetchedJob, error) {
+	entries, err := jq.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    GroupName,
+		Consumer: consumerName,
+		Streams:  []string{StreamName, ">"},
+		Count:    count,
+		Block:    block,
+	}).Result()
+	if err != nil && err != redis.Nil {
+		return nil, err
 	}
+
+	var fetched []FetchedJob
+	for _, stream := range entries {
+		for _, message := range stream.Messages {
+			jobID, ok := message.Values["job_id"].(string)
+			if !ok {
+				jobID = ""
+			}
+			fetched = append(fetched, FetchedJob{MessageID: message.ID, JobID: jobID})
+		}
+	}
+	return fetched, nil
 }
 
-// RetryJob thực hiện retry theo Exponential Backoff hoặc chuyển sang Dead Letter Queue
-func (jq *JobQueue) RetryJob(ctx context.Context, job *Job, messageID string, jobErr error, baseDelay float64) error {
-	attempts := job.Attempts + 1
-	job.Attempts = attempts
-
-	errMsg := "max retries exceeded"
+// RetryJob schedules another attempt with exponential backoff or sends the job to the dead-letter stream.
+func (jq *JobQueue) RetryJob(ctx context.Context, job *Job, messageID string, jobErr error, baseDelay time.Duration) error {
+	updated := *job
+	updated.Attempts++
+	updated.Error = "max retries exceeded"
 	if jobErr != nil {
-		errMsg = jobErr.Error()
+		updated.Error = jobErr.Error()
 	}
-	job.Error = errMsg
 
-	// Nếu quá số lần retry tối đa -> Đẩy sang DLQ
-	if attempts >= MaxAttempts {
-		job.Status = StatusDeadLetter
-		jq.saveJob(ctx, job)
-		jq.UpdateStatus(ctx, job, StatusDeadLetter)
+	oldStatus := job.Status
+	pipe := jq.rdb.TxPipeline()
+	pipe.SRem(ctx, jq.statusKey(oldStatus), job.ID)
 
-		jq.rdb.XAdd(ctx, &redis.XAddArgs{
+	if updated.Attempts >= MaxAttempts {
+		updated.Status = StatusDeadLetter
+	} else {
+		updated.Status = StatusRetrying
+	}
+
+	data, err := updated.Serialize()
+	if err != nil {
+		return err
+	}
+	pipe.SAdd(ctx, jq.statusKey(updated.Status), job.ID)
+	pipe.Set(ctx, jq.jobKey(job.ID), data, 0)
+
+	if updated.Status == StatusDeadLetter {
+		pipe.XAdd(ctx, &redis.XAddArgs{
 			Stream: DLStreamName,
 			Values: map[string]interface{}{
 				"job_id":   job.ID,
-				"attempts": attempts,
-				"error":    job.Error,
+				"attempts": updated.Attempts,
+				"error":    updated.Error,
 			},
 		})
-		jq.Ack(ctx, messageID)
-		fmt.Printf("Job %s moved to DLQ\n", job.ID)
-		return nil
+		pipe.XAck(ctx, StreamName, GroupName, messageID)
+	} else {
+		delay := baseDelay * time.Duration(math.Pow(2, float64(updated.Attempts-1)))
+		executeAt := time.Now().Add(delay).UnixMilli()
+		pipe.ZAdd(ctx, DelayedKey, redis.Z{Score: float64(executeAt), Member: job.ID})
+		pipe.XAck(ctx, StreamName, GroupName, messageID)
 	}
 
-	// Calculate exponential backoff delay
-	delaySeconds := baseDelay * math.Pow(2, float64(attempts-1))
-	executeAt := float64(time.Now().Unix()) + delaySeconds
-
-	job.Status = StatusRetrying
-	jq.saveJob(ctx, job)
-	jq.UpdateStatus(ctx, job, StatusRetrying)
-
-	// Thêm vào Redis ZSET
-	jq.rdb.ZAdd(ctx, DelayedKey, redis.Z{
-		Score:  executeAt,
-		Member: job.ID,
-	})
-	jq.Ack(ctx, messageID)
-
-	fmt.Printf("Retry job=%s, attempt=%d\n", job.ID, attempts)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("record failed job attempt: %w", err)
+	}
+	*job = updated
 	return nil
 }
 
-// EnqueueScheduledJobs quét ZSET tìm các job đã tới giờ chạy và đẩy lại Stream
+// EnqueueScheduledJobs moves due retry jobs back to the stream.
 func (jq *JobQueue) EnqueueScheduledJobs(ctx context.Context) (int, error) {
-	now := float64(time.Now().Unix())
-
-	readyJobs, err := jq.rdb.ZRangeByScore(ctx, DelayedKey, &redis.ZRangeBy{
-		Min: "0",
-		Max: fmt.Sprintf("%f", now),
-	}).Result()
-
-	if err != nil || len(readyJobs) == 0 {
-		return 0, err
-	}
-
-	// Dùng Pipeline trong Go
-	pipe := jq.rdb.Pipeline()
-	for _, jobID := range readyJobs {
-		pipe.XAdd(ctx, &redis.XAddArgs{
-			Stream: StreamName,
-			Values: map[string]interface{}{"job_id": jobID},
-		})
-		pipe.ZRem(ctx, DelayedKey, jobID)
-	}
-
-	_, err = pipe.Exec(ctx)
+	const script = `
+local ready = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, ARGV[2])
+local enqueued = 0
+for _, jobID in ipairs(ready) do
+	if redis.call("ZREM", KEYS[1], jobID) == 1 then
+		redis.call("XADD", KEYS[2], "*", "job_id", jobID)
+		enqueued = enqueued + 1
+	end
+end
+return enqueued
+`
+	count, err := jq.rdb.Eval(ctx, script, []string{DelayedKey, StreamName}, time.Now().UnixMilli(), 100).Int()
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("enqueue scheduled jobs: %w", err)
 	}
-
-	return len(readyJobs), nil
+	return count, nil
 }
 
-// GetJobsByStatus lấy danh sách job theo trạng thái
+// GetJobsByStatus retrieves jobs indexed under the given status.
 func (jq *JobQueue) GetJobsByStatus(ctx context.Context, status string) ([]*Job, error) {
 	ids, err := jq.rdb.SMembers(ctx, jq.statusKey(status)).Result()
 	if err != nil {
 		return nil, err
 	}
 
-	var jobs []*Job
+	jobs := make([]*Job, 0, len(ids))
 	for _, jobID := range ids {
 		job, err := jq.GetJob(ctx, jobID)
-		if err == nil && job != nil {
+		if err != nil {
+			return nil, fmt.Errorf("get job %s: %w", jobID, err)
+		}
+		if job != nil {
 			jobs = append(jobs, job)
 		}
 	}
 	return jobs, nil
 }
 
-// ReclaimStale tự động nhận lại các message bị treo (pending) quá thời gian quy định
-func (jq *JobQueue) ReclaimStale(ctx context.Context, consumerName string, minIdleTime time.Duration) error {
-	messages, _, err := jq.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+// ReclaimStale claims pending messages that have been idle for at least minIdleTime.
+func (jq *JobQueue) ReclaimStale(ctx context.Context, consumerName string, minIdleTime time.Duration, start string) ([]FetchedJob, string, error) {
+	messages, next, err := jq.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 		Stream:   StreamName,
 		Group:    GroupName,
 		Consumer: consumerName,
 		MinIdle:  minIdleTime,
-		Start:    "0-0",
+		Start:    start,
 		Count:    10,
 	}).Result()
+	if err != nil {
+		return nil, start, err
+	}
 
+	reclaimed := make([]FetchedJob, 0, len(messages))
+	for _, message := range messages {
+		jobID, ok := message.Values["job_id"].(string)
+		if !ok {
+			jobID = ""
+		}
+		reclaimed = append(reclaimed, FetchedJob{MessageID: message.ID, JobID: jobID})
+	}
+	return reclaimed, next, nil
+}
+
+// Ack acknowledges a processed stream message.
+func (jq *JobQueue) Ack(ctx context.Context, messageID string) error {
+	return jq.rdb.XAck(ctx, StreamName, GroupName, messageID).Err()
+}
+
+// UpdateStatus atomically updates a job record and its status index.
+func (jq *JobQueue) UpdateStatus(ctx context.Context, job *Job, newStatus string) error {
+	updated := *job
+	updated.Status = newStatus
+	data, err := updated.Serialize()
 	if err != nil {
 		return err
 	}
 
-	if len(messages) == 0 {
-		return nil
+	pipe := jq.rdb.TxPipeline()
+	pipe.SRem(ctx, jq.statusKey(job.Status), job.ID)
+	pipe.SAdd(ctx, jq.statusKey(newStatus), job.ID)
+	pipe.Set(ctx, jq.jobKey(job.ID), data, 0)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("update job %s status: %w", job.ID, err)
 	}
 
-	fmt.Printf("Reclaimed %d stale messages\n", len(messages))
-	for _, msg := range messages {
-		fmt.Printf("Processing stale message: %s\n", msg.ID)
-	}
-	return nil
-}
-
-// Ack xác nhận đã xử lý xong message
-func (jq *JobQueue) Ack(ctx context.Context, messageID string) {
-	jq.rdb.XAck(ctx, StreamName, GroupName, messageID)
-}
-
-// UpdateStatus cập nhật Set chứa trạng thái Job
-func (jq *JobQueue) UpdateStatus(ctx context.Context, job *Job, newStatus string) {
-	oldStatus := job.Status
-	jq.rdb.SRem(ctx, jq.statusKey(oldStatus), job.ID)
-	jq.rdb.SAdd(ctx, jq.statusKey(newStatus), job.ID)
 	job.Status = newStatus
-	jq.saveJob(ctx, job)
-}
-
-func (jq *JobQueue) createConsumerGroup(ctx context.Context) {
-	err := jq.rdb.XGroupCreateMkStream(ctx, StreamName, GroupName, "0").Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
-		fmt.Printf("XGroupCreate error: %v\n", err)
-	}
+	return nil
 }
 
 func (jq *JobQueue) jobKey(jobID string) string {
@@ -259,12 +253,4 @@ func (jq *JobQueue) jobKey(jobID string) string {
 
 func (jq *JobQueue) statusKey(status string) string {
 	return fmt.Sprintf("%s:%s", StatusPrefix, status)
-}
-
-func (jq *JobQueue) saveJob(ctx context.Context, job *Job) error {
-	data, err := job.Serialize()
-	if err != nil {
-		return err
-	}
-	return jq.rdb.Set(ctx, jq.jobKey(job.ID), data, 0).Err()
 }

@@ -36,7 +36,7 @@ func (r *JobRegistry) Execute(ctx context.Context, job *Job) error {
 	return handler(ctx, job.Payload)
 }
 
-// Các hằng số định nghĩa trạng thái Job
+// Job status constants.
 const (
 	StatusQueued     = "queued"
 	StatusProcessing = "processing"
@@ -45,17 +45,17 @@ const (
 	StatusDeadLetter = "dead-letter"
 )
 
-// Job Struct đại diện cho một tác vụ
+// Job represents a task.
 type Job struct {
 	ID       string          `json:"id"`
-	Type     string          `json:"type"`    // Tên hàm/task (thay cho func trong Python)
-	Payload  json.RawMessage `json:"payload"` // Dữ liệu tham số động dưới dạng JSON
+	Type     string          `json:"type"`    // The task type, used to select a handler.
+	Payload  json.RawMessage `json:"payload"` // Dynamic task arguments encoded as JSON.
 	Status   string          `json:"status"`
 	Attempts int             `json:"attempts"`
 	Error    string          `json:"error,omitempty"`
 }
 
-// Tạo một Job mới
+// NewJob creates a job.
 func NewJob(jobType string, payload interface{}) (*Job, error) {
 	bytes, err := json.Marshal(payload)
 	if err != nil {
@@ -71,7 +71,7 @@ func NewJob(jobType string, payload interface{}) (*Job, error) {
 	}, nil
 }
 
-// Serialize Job ra chuỗi JSON
+// Serialize encodes a job as JSON.
 func (j *Job) Serialize() (string, error) {
 	bytes, err := json.Marshal(j)
 	if err != nil {
@@ -80,7 +80,7 @@ func (j *Job) Serialize() (string, error) {
 	return string(bytes), nil
 }
 
-// Deserialize chuỗi JSON ngược lại thành Job Struct
+// DeserializeJob decodes a job from JSON.
 func DeserializeJob(data string) (*Job, error) {
 	var j Job
 	err := json.Unmarshal([]byte(data), &j)

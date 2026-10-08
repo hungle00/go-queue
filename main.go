@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -19,15 +20,19 @@ type EmailPayload struct {
 func main() {
 	// Parse command line flags
 	mode := flag.String("mode", "producer", "Mode to run: 'producer' or 'worker'")
+	redisAddr := flag.String("redis-addr", "localhost:6379", "Redis server address")
+	consumer := flag.String("consumer", fmt.Sprintf("worker-%d", os.Getpid()), "Worker consumer name")
+	concurrency := flag.Int("concurrency", 3, "Number of concurrent worker handlers")
 	flag.Parse()
 
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	rdb := redis.NewClient(&redis.Options{Addr: *redisAddr})
+	defer rdb.Close()
 
 	switch *mode {
 	case "producer":
 		runProducer(rdb)
 	case "worker":
-		runWorker(rdb)
+		runWorker(rdb, *consumer, *concurrency)
 	default:
 		log.Fatalf("Unknown mode: %s. Use -mode=producer or -mode=worker", *mode)
 	}
@@ -48,7 +53,7 @@ func runProducer(rdb *redis.Client) {
 	}
 }
 
-func runWorker(rdb *redis.Client) {
+func runWorker(rdb *redis.Client, consumer string, concurrency int) {
 	registry := NewJobRegistry()
 
 	registry.Register("send_welcome_email", func(ctx context.Context, payload json.RawMessage) error {
@@ -56,11 +61,17 @@ func runWorker(rdb *redis.Client) {
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return err
 		}
+		// Simulate a failure for demonstration purposes
+		// if p.UserID == 101 {
+    	// 	return fmt.Errorf("simulated failure")
+		// }
 		fmt.Printf("[Worker] Processing email for %s...\n", p.Email)
 		time.Sleep(1 * time.Second)
 		return nil
 	})
 
-	pool := NewWorkerPool(rdb, registry, "worker-node-1", 3)
-	pool.Start()
+	pool := NewWorkerPool(rdb, registry, consumer, concurrency)
+	if err := pool.Start(); err != nil {
+		log.Printf("Worker stopped with an error: %v", err)
+	}
 }
